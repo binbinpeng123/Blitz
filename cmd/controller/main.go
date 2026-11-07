@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -10,21 +11,42 @@ import (
 
 	cmdutil "github.com/argoproj/argo-workflows/v3/util/cmd"
 	"github.com/argoproj/argo-workflows/v3/util/logs"
+	"github.com/argoproj/argo-workflows/v3/workflow/events"
+	argoenv "github.com/argoproj/pkg/env"
 	kubecli "github.com/argoproj/pkg/kube/cli"
 	"github.com/argoproj/pkg/stats"
 	"github.com/binbinpeng123/blitz/pkg/conf"
 	"github.com/binbinpeng123/blitz/pkg/controller"
 	"github.com/binbinpeng123/blitz/pkg/dao"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"gitlab.hobot.cc/aidi/slardar/env"
+	slardatlog "gitlab.hobot.cc/aidi/slardar/log"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtimeutil "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 )
 
 const (
 	CliName = "blitz-controller"
 )
+
+func init() {
+	env.Init()
+	slardatlog.Init()
+	configPath := os.Getenv("CONFIG_PATH")
+	if configPath == "" {
+		configPath = "/app/configs/workload-manager.yaml"
+	}
+	if err := conf.LoadFromFile(configPath); err != nil {
+		panic(err)
+	}
+	conf.Conf.Check()
+}
 
 func main() {
 	if err := newRootCommand().ExecuteContext(context.Background()); err != nil {
@@ -132,14 +154,55 @@ func run(ctx context.Context, opts *controller.Options) error {
 	}
 
 	// 10.选主并启动Controller
-	// 注意：选主逻辑尚未实现，未关闭选主时直接返回错误，避免进程静默空转。
-	if os.Getenv("LEADER_ELECTION_DISABLE") != "true" {
-		return fmt.Errorf("leader election is not implemented yet, set LEADER_ELECTION_DISABLE=true to run in single-instance mode")
+	leaderElectionOff := os.Getenv("LEADER_ELECTION_DISABLE")
+	if leaderElectionOff == "true" {
+		log.Info("Leader election is turned off. Running in single-instance mode")
+		log.WithField("id", "single-instance").Info("starting leading")
+		go ctrl.Run(ctx, opts.Workers)
+	} else {
+		// 获取节点id
+		nodeID, ok := os.LookupEnv("LEADER_ELECTION_IDENTITY")
+		if !ok {
+			log.Fatal("LEADER_ELECTION_IDENTITY must be set so that the workload-controllers can elect a leader")
+		}
+		// 获取命名空间
+		ns := os.Getenv("NAMESPACE")
+		go leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
+			Lock: &resourcelock.LeaseLock{
+				LeaseMeta:  metav1.ObjectMeta{Name: CliName, Namespace: ns},
+				Client:     kubeClient.CoordinationV1(),
+				LockConfig: resourcelock.ResourceLockConfig{Identity: nodeID, EventRecorder: events.NewEventRecorderManager(kubeClient).Get(ns)},
+			},
+			LeaseDuration: argoenv.LookupEnvDurationOr("LEADER_ELECTION_LEASE_DURATION", 15*time.Minute),
+			RenewDeadline: argoenv.LookupEnvDurationOr("LEADER_ELECTION_RENEW_DEADLINE", 10*time.Minute),
+			RetryPeriod:   argoenv.LookupEnvDurationOr("LEADER_ELECTION_RETRY_PERIOD", 5*time.Minute),
+			Callbacks: leaderelection.LeaderCallbacks{
+				OnStartedLeading: func(ctx context.Context) {
+					log.Infof("leader election started")
+					go ctrl.Run(ctx, opts.Workers)
+				},
+				OnStoppedLeading: func() {
+					log.WithField("id", nodeID).Info("stopped leading")
+					cancel()
+				},
+				OnNewLeader: func(identity string) {
+					log.WithField("leader", identity).Info("new leader")
+				},
+			},
+			ReleaseOnCancel: false,
+		})
+
+		// 探活
+		http.HandleFunc("/healthz", ctrl.Healthz)
+		http.Handle("/metrics", promhttp.Handler())
+
+		go func() {
+			log.Println(http.ListenAndServe(":6060", nil))
+		}()
+
+		<-ctx.Done()
+		return nil
 	}
-	log.Info("Leader election is turned off. Running in single-instance mode")
-	log.WithField("id", "single-instance").Info("starting leading")
-	go ctrl.Run(ctx, opts.Workers)
-	<-ctx.Done()
 
 	return nil
 }
