@@ -155,7 +155,7 @@ func run(ctx context.Context, opts *controller.Options) error {
 
 	// 10.选主并启动Controller
 	leaderElectionOff := os.Getenv("LEADER_ELECTION_DISABLE")
-	if leaderElectionOff != "true" {
+	if leaderElectionOff == "true" {
 		log.Info("Leader election is turned off. Running in single-instance mode")
 		log.WithField("id", "single-instance").Info("starting leading")
 		go ctrl.Run(ctx, opts.Workers)
@@ -178,6 +178,7 @@ func run(ctx context.Context, opts *controller.Options) error {
 			RetryPeriod:   argoenv.LookupEnvDurationOr("LEADER_ELECTION_RETRY_PERIOD", 5*time.Minute),
 			Callbacks: leaderelection.LeaderCallbacks{
 				OnStartedLeading: func(ctx context.Context) {
+					log.Infof("leader election started")
 					go ctrl.Run(ctx, opts.Workers)
 				},
 				OnStoppedLeading: func() {
