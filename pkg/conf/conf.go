@@ -54,6 +54,9 @@ type Config struct {
 	DBConnMaxIdleTimeSeconds       int               `yaml:"db_conn_max_idle_time_seconds"`
 	RefreshJobRankIntervalMinutes  int               `yaml:"refresh_job_rank_interval_minutes"`
 	RefreshRetryDagIntervalSeconds int               `yaml:"refresh_retry_dag_interval_seconds"`
+
+	// 老 Kafka 集群，pkg/client/kafka.go 使用
+	KafkaServers string `yaml:"kafka_servers"`
 }
 
 func (f *Config) Init() {
