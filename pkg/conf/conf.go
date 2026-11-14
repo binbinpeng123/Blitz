@@ -45,6 +45,14 @@ func Load(path string) error {
 	return nil
 }
 
+type Redis struct {
+	MasterAddr     string `yaml:"master_addr" mapstructure:"master_addr"`
+	SentinelAddr   string `yaml:"sentinel_addr" mapstructure:"sentinel_addr"`
+	SentinelMaster string `yaml:"sentinel_master" mapstructure:"sentinel_master"`
+	Password       string `yaml:"password" mapstructure:"password"`
+	DB             int    `yaml:"db" mapstructure:"db"`
+}
+
 type Config struct {
 	K8SKubeconfig                  map[string]string `yaml:"k8s_kubeconfig"`
 	DBDsn                          map[string]string `yaml:"db_dsn"`
@@ -54,9 +62,16 @@ type Config struct {
 	DBConnMaxIdleTimeSeconds       int               `yaml:"db_conn_max_idle_time_seconds"`
 	RefreshJobRankIntervalMinutes  int               `yaml:"refresh_job_rank_interval_minutes"`
 	RefreshRetryDagIntervalSeconds int               `yaml:"refresh_retry_dag_interval_seconds"`
+	MaximumQueuePendingJobs        int               `yaml:"maximum_queue_pending_jobs"`
+	SubmitJobNum                   int64             `yaml:"submit_job_num"`
+
+	// Redis
+	RedisConfig *Redis `yaml:"redis" mapstructure:"redis"`
 
 	// 老 Kafka 集群，pkg/client/kafka.go 使用
 	KafkaServers string `yaml:"kafka_servers"`
+
+	FeishuRobotURL string `yaml:"feishu_robot_url"`
 }
 
 func (f *Config) Init() {
