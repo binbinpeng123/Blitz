@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/binbinpeng123/blitz/client"
 	"github.com/binbinpeng123/blitz/pkg"
+	"github.com/binbinpeng123/blitz/pkg/client"
 )
 
 const LastRecord = 1

@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/binbinpeng123/blitz/pkg"
+	"github.com/binbinpeng123/blitz/pkg/client"
 	"github.com/binbinpeng123/blitz/pkg/dao"
+	"github.com/binbinpeng123/blitz/pkg/rank"
 	"github.com/petermattis/goid"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
@@ -17,7 +19,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-
 	"k8s.io/client-go/informers"
 	informerv1 "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -25,11 +26,11 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
-)
-
-const (
-	InfraComputingLabelKey = "infra-computing"
-	InfraComputingLabelVal = "v2"
+	volcanov1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
+	"volcano.sh/apis/pkg/client/clientset/versioned"
+	"volcano.sh/apis/pkg/client/informers/externalversions"
+	volcanoinformerv1 "volcano.sh/apis/pkg/client/informers/externalversions/batch/v1alpha1"
+	pginformerv1 "volcano.sh/apis/pkg/client/informers/externalversions/scheduling/v1beta1"
 )
 
 const (
@@ -38,6 +39,8 @@ const (
 	PodStatusIndex       = "podStatus"
 	PodEventIndex        = "podEvent"
 	annotationRetryRound = "retry_round"
+	vjStatusIndex        = "vjStatus"
+	vjResyncPeriod       = 20 * time.Minute
 )
 
 type Controller struct {
@@ -56,6 +59,21 @@ type Controller struct {
 	evInformer  informerv1.EventInformer
 	evQueue     workqueue.RateLimitingInterface
 	nsListener  listersv1.NamespaceLister
+
+	// volcano
+	volcanoClient versioned.Interface
+	vjQueue       workqueue.RateLimitingInterface
+	vjInformer    volcanoinformerv1.JobInformer
+	pgInformer    pginformerv1.PodGroupInformer
+	// terminatingQueue 用于处理进入Terminating状态的任务，由Pod Deleted、VJ Deleted和定时任务触发，确保任务终态的正确性和及时性
+	jobTerminatingQueue workqueue.DelayingInterface
+
+	// runningQueue 用于处理Running状态的任务
+	jobRunningQueue workqueue.DelayingInterface
+
+	rankController *rank.RankController
+
+	redisClient *client.RedisClient
 }
 
 func NewController(config *rest.Config, kubeClient kubernetes.Interface, k8s string) (*Controller, error) {
@@ -66,11 +84,19 @@ func NewController(config *rest.Config, kubeClient kubernetes.Interface, k8s str
 	}
 
 	ctrl := &Controller{
-		db:         db,
-		kubeClient: kubeClient,
-		k8s:        k8s,
-		podQueue:   workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "pods"),
-		evQueue:    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "ev"),
+		db:                     db,
+		submitingNSsWithCancel: make(map[string]context.CancelFunc),
+		kubeClient:             kubeClient,
+		k8s:                    k8s,
+		podQueue:               workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "pods"),
+		evQueue:                workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "ev"),
+		volcanoClient:          versioned.NewForConfigOrDie(config),
+		vjQueue:                workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "vj"),
+		jobTerminatingQueue:    workqueue.NewNamedDelayingQueue("job-terminating"),
+		jobRunningQueue:        workqueue.NewNamedDelayingQueue("job-running"),
+		rankController:         rank.NewRankController(),
+
+		redisClient: client.NewRedisClient(),
 	}
 
 	return ctrl, nil
@@ -82,39 +108,47 @@ func NewController(config *rest.Config, kubeClient kubernetes.Interface, k8s str
 //   - ctx: 上下文，用于控制控制器生命周期
 //   - workers: Worker协程数量
 func (ctrl *Controller) Run(ctx context.Context, workers int) {
-	// 1.处理panic
+	// 处理panic
 	defer runtime.HandleCrash()
 
 	log.Info("Starting workload-controller Controller")
 	log.WithField("worker", workers).Info("Current Worker Numbers")
 
-	// 2.Pod Informer使用单独的Factory，以便设置LabelSelector过滤非任务的Pod，避免太多系统Pod变更影响性能
+	// Pod Informer使用单独的Factory，以便设置LabelSelector过滤非任务的Pod，避免太多系统Pod变更影响性能
 	podInformerFactory := informers.NewSharedInformerFactoryWithOptions(ctrl.kubeClient, podResyncPeriod, informers.WithTweakListOptions(func(lo *metav1.ListOptions) {
-		lo.LabelSelector = fmt.Sprintf("%s=%s", InfraComputingLabelKey, InfraComputingLabelVal)
+		lo.LabelSelector = fmt.Sprintf("%s=%s", pkg.InfraComputingLabelKey, pkg.InfraComputingLabelVal)
 	}))
 	ctrl.podInformer = podInformerFactory.Core().V1().Pods()
 	ctrl.initPodInformer()
 
-	// 3.创建K8S Informer
+	// 创建K8S Informer
 	k8sFactory := informers.NewSharedInformerFactory(ctrl.kubeClient, podResyncPeriod)
 	ctrl.evInformer = k8sFactory.Core().V1().Events()
 	ctrl.initEventInformer()
 
 	ctrl.nsListener = k8sFactory.Core().V1().Namespaces().Lister()
 
-	// 4.启动informer
+	// 初始化Volcano Informer工厂
+	volcanoFactory := externalversions.NewSharedInformerFactory(ctrl.volcanoClient, vjResyncPeriod)
+	ctrl.vjInformer = volcanoFactory.Batch().V1alpha1().Jobs()
+	ctrl.pgInformer = volcanoFactory.Scheduling().V1beta1().PodGroups()
+	ctrl.initVJInformer()
+
+	// 启动informer
 	k8sFactory.Start(ctx.Done())
 	podInformerFactory.Start(ctx.Done())
+	volcanoFactory.Start(ctx.Done())
 	log.Info("Kubernetes informers started")
 
-	// 5.等待List-Watch机制同步数据完成
+	// 等待List-Watch机制同步数据完成
 	c, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	log.Info("Waiting for informer caches to sync...")
 	if !cache.WaitForCacheSync(
 		c.Done(),
 		ctrl.podInformer.Informer().HasSynced,
-		ctrl.evInformer.Informer().HasSynced) {
+		ctrl.evInformer.Informer().HasSynced,
+		ctrl.vjInformer.Informer().HasSynced) {
 		log.Fatal("Timed out waiting for caches to sync")
 	}
 	log.Info("All informer caches synced successfully")
@@ -128,6 +162,7 @@ func (ctrl *Controller) Run(ctx context.Context, workers int) {
 	log.WithField("workers", workers).Info("Worker goroutines started")
 
 	// cron
+	go ctrl.runCron(ctx)
 	log.Info("Cron jobs started")
 
 	// SIGTERM → signal.NotifyContext 让 ctx 取消，解除以下 <-ctx.Done() 阻塞。
@@ -144,6 +179,26 @@ func (ctrl *Controller) Run(ctx context.Context, workers int) {
 	ctrl.drainWorkers(&workWG, 25*time.Second)
 
 	log.Info("Controller shutdown complete")
+}
+
+// 过滤其它vj
+func (ctrl *Controller) filterVJ(obj interface{}) bool {
+	vj, ok := obj.(*volcanov1.Job)
+	if !ok {
+		newObj, ok := obj.(*cache.DeletedFinalStateUnknown)
+		if !ok {
+			return false
+		}
+		vj, ok = newObj.Obj.(*volcanov1.Job)
+		if !ok {
+			return false
+		}
+	}
+	if vj.Labels[pkg.InfraComputingLabelKey] != pkg.InfraComputingLabelVal {
+		return false
+	}
+
+	return true
 }
 
 // drainWorkers 等所有 worker WaitGroup Done，超时递增 ShutdownForceTotal。
@@ -264,6 +319,7 @@ func (ctrl *Controller) operatePod(ctx context.Context, obj interface{}, key str
 		if err = ctrl.db.UpdateJobStatus(ctx, job.JobID, job.JobName, update); err != nil {
 			return true, errors.Wrap(err, "failed to update job status")
 		}
+		ctrl.rankController.UpdateJobRankQueue(ctx, []*dao.JobStatus{job}, rank.RankEventScheduled)
 	} else if (job.ScheduledTime == nil && !update.ScheduledTime.IsZero()) || (job.RunningTime == nil && !update.RunningTime.IsZero()) {
 		// Pod Infomer慢的情况下，会出现任务结束后，Pod事件才过来，尽量补全调度时间和运行时间
 		if err = ctrl.db.UpdateJobStatus(ctx, job.JobID, job.JobName, &dao.JobUpdateParams{ScheduledTime: update.ScheduledTime, RunningTime: update.RunningTime}); err != nil {
@@ -371,6 +427,46 @@ func (ctrl *Controller) initEventInformer() {
 	log.Info("Event informer indexer initialized successfully")
 }
 
+func (ctrl *Controller) initVJInformer() {
+	// 为volcano job添加状态索引
+	err := ctrl.vjInformer.Informer().AddIndexers(cache.Indexers{
+		vjStatusIndex: func(obj interface{}) ([]string, error) {
+			vj, ok := obj.(*volcanov1.Job)
+			if !ok {
+				log.WithField("type", fmt.Sprintf("%T", obj)).Debug("Object is not a Volcano Job")
+				return nil, nil
+			}
+			indexKey := fmt.Sprintf("%s/%s", vj.Namespace, vj.Status.State.Phase)
+			log.WithFields(log.Fields{
+				"job":   vj.Name,
+				"phase": vj.Status.State.Phase,
+				"index": indexKey,
+			}).Debug("Adding job to status index")
+
+			return []string{indexKey}, nil
+		},
+	})
+	if err != nil {
+		log.WithField("error", err).Fatal("Failed to add vj status indexer")
+	}
+
+	// 为volcano job添加事件处理程序
+	ctrl.vjInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
+		FilterFunc: ctrl.filterVJ,
+		Handler: cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				ctrl.enqueue(obj, ctrl.vjQueue)
+			},
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				ctrl.enqueue(newObj, ctrl.vjQueue)
+			},
+			DeleteFunc: func(obj interface{}) {
+				ctrl.enqueue(obj, ctrl.vjQueue)
+			},
+		},
+	})
+}
+
 func (ctrl *Controller) enqueue(obj interface{}, q workqueue.RateLimitingInterface) {
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err != nil {
@@ -378,4 +474,8 @@ func (ctrl *Controller) enqueue(obj interface{}, q workqueue.RateLimitingInterfa
 		return
 	}
 	q.Add(key)
+}
+
+func (ctrl *Controller) finishJob(ctx context.Context, job *dao.JobStatus, update *dao.JobUpdateParams) error {
+	return nil
 }

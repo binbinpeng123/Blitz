@@ -8,14 +8,17 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/binbinpeng123/blitz/pkg"
+	"github.com/binbinpeng123/blitz/pkg/conf"
 	"github.com/binbinpeng123/blitz/pkg/dao"
+	"github.com/binbinpeng123/blitz/pkg/rank"
 	jmoironsqlx "github.com/jmoiron/sqlx"
+	slardarsqlx "gitlab.hobot.cc/aidi/slardar/sqlx"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
-	slardarsqlx "gitlab.hobot.cc/aidi/slardar/sqlx"
 )
 
 // containsMatcher 用 "|" 分隔期望片段，命中全部片段即通过。
@@ -47,6 +50,15 @@ func newMockDao(t *testing.T) (*dao.Dao, sqlmock.Sqlmock) {
 	}
 	t.Cleanup(func() { _ = sdb.Close() })
 	return &dao.Dao{DB: &slardarsqlx.DB{DB: jmoironsqlx.NewDb(sdb, "mysql").Unsafe()}}, mock
+}
+
+// newTestController 构造带 sqlmock DB 与 miniredis 的 Controller，
+// operatePod 在状态推进时会同步更新 redis 排名队列。
+func newTestController(t *testing.T, db *dao.Dao) (*Controller, *miniredis.Miniredis) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	conf.Conf = conf.Config{RedisConfig: &conf.Redis{MasterAddr: mr.Addr()}}
+	return &Controller{db: db, rankController: rank.NewRankController()}, mr
 }
 
 func defaultPod(start time.Time) *v1.Pod {
@@ -300,19 +312,31 @@ func TestOperatePod(t *testing.T) {
 	t.Run("queuing job advances to initializing", func(t *testing.T) {
 		db, mock := newMockDao(t)
 		expectInsertPodInfo(mock)
-		expectSelectJob(mock, 1, "j1", "job-name", pkg.JobPhaseQueuing, nil, nil)
+		// 带 namespace 列，验证排名队列按 job.Namespace 拼接 key
+		mock.ExpectQuery("select * from job_status|job_id = \"j1\"|is_deleted = 0|last_record = 0").
+			WillReturnRows(sqlmock.NewRows([]string{
+				"id", "job_id", "job_name", "phase", "scheduled_time", "running_time", "namespace",
+			}).AddRow(1, "j1", "job-name", pkg.JobPhaseQueuing, nil, nil, "default"))
 		mock.ExpectExec("update job_status set phase = ?,col_rank = 0,scheduled_time = ?|where is_deleted = false").
 			WithArgs(pkg.JobPhaseInitializing, sqlmock.AnyArg(), sqlmock.AnyArg(), "j1",
 				pkg.JobPhaseInitializing, pkg.JobPhaseQueuing).
 			WillReturnResult(sqlmock.NewResult(0, 0))
 
-		ctrl := &Controller{db: db}
+		ctrl, mr := newTestController(t, db)
+		// 状态推进时应同时把 job 从 submitted 排名队列移除
+		if _, err := mr.ZAdd("default_submitted_job_rank_queue", 1, "j1"); err != nil {
+			t.Fatalf("seed submitted queue: %v", err)
+		}
+
 		requeue, err := ctrl.operatePod(context.Background(), defaultPod(start), "default/pod-1", true)
 		if requeue || err != nil {
 			t.Fatalf("got requeue=%t err=%v, want false/nil", requeue, err)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Fatalf("unmet expectations: %v", err)
+		}
+		if _, err := mr.ZScore("default_submitted_job_rank_queue", "j1"); err == nil {
+			t.Fatal("job still in submitted rank queue")
 		}
 	})
 
@@ -324,7 +348,7 @@ func TestOperatePod(t *testing.T) {
 			WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "j1").
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
-		ctrl := &Controller{db: db}
+		ctrl, _ := newTestController(t, db)
 		requeue, err := ctrl.operatePod(context.Background(), defaultPod(start), "default/pod-1", true)
 		if requeue || err != nil {
 			t.Fatalf("got requeue=%t err=%v, want false/nil", requeue, err)
@@ -339,7 +363,7 @@ func TestOperatePod(t *testing.T) {
 		expectInsertPodInfo(mock)
 		expectSelectJob(mock, 1, "j1", "job-name", pkg.JobPhaseRunning, start, start)
 
-		ctrl := &Controller{db: db}
+		ctrl, _ := newTestController(t, db)
 		requeue, err := ctrl.operatePod(context.Background(), defaultPod(start), "default/pod-1", true)
 		if requeue || err != nil {
 			t.Fatalf("got requeue=%t err=%v, want false/nil", requeue, err)
@@ -354,7 +378,7 @@ func TestOperatePod(t *testing.T) {
 		expectInsertPodInfo(mock)
 		expectSelectJob(mock)
 
-		ctrl := &Controller{db: db}
+		ctrl, _ := newTestController(t, db)
 		requeue, err := ctrl.operatePod(context.Background(), defaultPod(start), "default/pod-1", true)
 		if !requeue {
 			t.Fatal("requeue = false, want true")
@@ -368,7 +392,7 @@ func TestOperatePod(t *testing.T) {
 		db, mock := newMockDao(t)
 		mock.ExpectExec("INSERT IGNORE INTO pod_info").WillReturnError(errTest)
 
-		ctrl := &Controller{db: db}
+		ctrl, _ := newTestController(t, db)
 		requeue, err := ctrl.operatePod(context.Background(), defaultPod(start), "default/pod-1", true)
 		if !requeue {
 			t.Fatal("requeue = false, want true")
