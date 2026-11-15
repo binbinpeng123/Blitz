@@ -72,6 +72,9 @@ type Config struct {
 	KafkaServers string `yaml:"kafka_servers"`
 
 	FeishuRobotURL string `yaml:"feishu_robot_url"`
+
+	// OffloadJobEnv 是否将任务环境变量卸载到ConfigMap
+	OffloadJobEnv bool `yaml:"offload_job_env"`
 }
 
 func (f *Config) Init() {
@@ -135,4 +138,10 @@ func (f *Config) Check() {
 	if err := f.ValidateDatabase(); err != nil {
 		panic(err)
 	}
+}
+
+type Dataset struct {
+	Name      string `yaml:"name"`
+	HostPath  string `yaml:"host_path"`
+	MountType string `yaml:"mount_type"`
 }
