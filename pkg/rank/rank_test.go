@@ -293,6 +293,105 @@ func TestGetTopRankPendingJobs(t *testing.T) {
 	})
 }
 
+func TestCalculateNilJob(t *testing.T) {
+	if got := calculate(nil); got != 0 {
+		t.Fatalf("calculate(nil) = %v, want 0", got)
+	}
+}
+
+func TestInitJobRankQueue(t *testing.T) {
+	ctx := context.Background()
+	const (
+		createdKey   = "default_created_job_rank_queue"
+		submittedKey = "default_submitted_job_rank_queue"
+	)
+	submittedAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	t.Run("rebuilds queues by phase and drops stale members", func(t *testing.T) {
+		rc, mr := newTestRankController(t)
+		// 预置脏数据，验证全量重建会清干净
+		if _, err := mr.ZAdd(createdKey, 1, "stale-created"); err != nil {
+			t.Fatalf("seed created queue: %v", err)
+		}
+		if _, err := mr.ZAdd(submittedKey, 1, "stale-submitted"); err != nil {
+			t.Fatalf("seed submitted queue: %v", err)
+		}
+
+		pending := testJob("job-a", "default", pkg.JobPhasePending, pkg.High, &submittedAt)
+		queuing := testJob("job-b", "default", pkg.JobPhaseQueuing, pkg.Low, &submittedAt)
+		running := testJob("job-c", "default", pkg.JobPhaseRunning, pkg.High, &submittedAt)
+
+		if err := rc.InitJobRankQueue(ctx, "default", []*dao.JobStatus{pending, queuing, running}); err != nil {
+			t.Fatalf("InitJobRankQueue: %v", err)
+		}
+
+		score, err := mr.ZScore(createdKey, "job-a")
+		if err != nil {
+			t.Fatalf("pending job missing in created queue: %v", err)
+		}
+		if math.Abs(score-calculate(pending)) > 1e-9 {
+			t.Fatalf("created score = %v, want %v", score, calculate(pending))
+		}
+		// 注意：miniredis 的 ZScore 对「key 存在但 member 不存在」返回 0,nil，
+		// 这里用 ZMembers 判断成员集合。
+		created, err := mr.ZMembers(createdKey)
+		if err != nil {
+			t.Fatalf("ZMembers(created): %v", err)
+		}
+		if strings.Join(created, ",") != "job-a" {
+			t.Fatalf("created members = %v, want [job-a]", created)
+		}
+
+		score, err = mr.ZScore(submittedKey, "job-b")
+		if err != nil {
+			t.Fatalf("queuing job missing in submitted queue: %v", err)
+		}
+		if math.Abs(score-calculate(queuing)) > 1e-9 {
+			t.Fatalf("submitted score = %v, want %v", score, calculate(queuing))
+		}
+		submittedMembers, err := mr.ZMembers(submittedKey)
+		if err != nil {
+			t.Fatalf("ZMembers(submitted): %v", err)
+		}
+		if strings.Join(submittedMembers, ",") != "job-b" {
+			t.Fatalf("submitted members = %v, want [job-b]", submittedMembers)
+		}
+	})
+
+	t.Run("empty jobs clears both queues", func(t *testing.T) {
+		rc, mr := newTestRankController(t)
+		if _, err := mr.ZAdd(createdKey, 1, "stale-created"); err != nil {
+			t.Fatalf("seed created queue: %v", err)
+		}
+		if _, err := mr.ZAdd(submittedKey, 1, "stale-submitted"); err != nil {
+			t.Fatalf("seed submitted queue: %v", err)
+		}
+
+		if err := rc.InitJobRankQueue(ctx, "default", nil); err != nil {
+			t.Fatalf("InitJobRankQueue: %v", err)
+		}
+		if mr.Exists(createdKey) || mr.Exists(submittedKey) {
+			t.Fatal("queues should be cleared for empty job list")
+		}
+	})
+
+	t.Run("redis error returned", func(t *testing.T) {
+		mr, err := miniredis.Run()
+		if err != nil {
+			t.Fatalf("miniredis.Run: %v", err)
+		}
+		rc := &RankController{
+			redisClient: &client.RedisClient{Client: redis.NewClient(&redis.Options{Addr: mr.Addr(), MaxRetries: 0})},
+		}
+		mr.Close()
+
+		job := testJob("job-a", "default", pkg.JobPhaseQueuing, pkg.High, &submittedAt)
+		if err := rc.InitJobRankQueue(ctx, "default", []*dao.JobStatus{job}); err == nil {
+			t.Fatal("expected error after redis shutdown")
+		}
+	})
+}
+
 func TestGetQueueingJobsCount(t *testing.T) {
 	ctx := context.Background()
 	const submittedKey = "default_submitted_job_rank_queue"

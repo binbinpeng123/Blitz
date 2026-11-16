@@ -173,3 +173,36 @@ func (conn *Dao) generateJobUpdateSQL(jobId string, data *JobUpdateParams) (sql 
 
 	return
 }
+
+/*
+UPDATE
+	t_job
+SET
+	col_rank = CASE
+		WHEN job_id = "xx1" THEN 1
+		WHEN job_id = "xx2" THEN 2
+	END
+WHERE
+	job_id IN(
+		"xx1",
+		"xx2"
+	);
+*/
+
+func (conn *Dao) BatchUpdateJobRank(ctx context.Context, jobs []*JobStatus) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	var ids []string
+	sqlStr := "UPDATE job_status SET col_rank = CASE "
+	for _, job := range jobs {
+		sqlStr += fmt.Sprintf(" WHEN id = %d THEN %d", job.ID, job.ColRank)
+		ids = append(ids, fmt.Sprintf("%d", job.ID))
+	}
+	sqlStr += " END WHERE id IN (" + strings.Join(ids, ",") + ") and phase in ('Queuing', 'Pending')"
+
+	_, err := conn.DB.ExecContext(ctx, sqlStr)
+
+	return err
+}

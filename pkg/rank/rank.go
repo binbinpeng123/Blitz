@@ -9,6 +9,7 @@ import (
 	"github.com/binbinpeng123/blitz/pkg"
 	"github.com/binbinpeng123/blitz/pkg/client"
 	"github.com/binbinpeng123/blitz/pkg/dao"
+	"github.com/go-redis/redis/v7"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -37,6 +38,10 @@ const (
 
 // job优先级 > 提交时间 > 随机字典序
 func calculate(job *dao.JobStatus) float64 {
+	if job == nil {
+		return 0
+	}
+
 	priorityScore := float64(pkg.JobPriorityRank(job.Priority))
 	submittedTimeScore := float64(maxTimestamp - job.SubmittedTime.Unix())
 	jobNameScore := jobIDScoreFloat(job.JobID)
@@ -66,7 +71,52 @@ func NewRankController() *RankController {
 	return &RankController{redisClient: client.NewRedisClient()}
 }
 
-// 通过mysql状态更新redis
+// InitJobRankQueue 初始化Job Rank
+func (ctrl *RankController) InitJobRankQueue(ctx context.Context, namespace string, jobs []*dao.JobStatus) error {
+	// 收集待创建job和待提交job
+	createdKey, submittedKey := fmt.Sprintf(createdJobRankQueue, namespace), fmt.Sprintf(submittedJobRankQueue, namespace)
+	var createdJobs, submittedJobs []*redis.Z
+	for _, job := range jobs {
+		score := calculate(job)
+		if job.Phase == pkg.JobPhasePending {
+			createdJobs = append(createdJobs, &redis.Z{Member: job.JobID, Score: score})
+		} else if job.Phase == pkg.JobPhaseQueuing {
+			submittedJobs = append(submittedJobs, &redis.Z{Member: job.JobID, Score: score})
+		}
+	}
+
+	// 清空redis中已有的created队列
+	if err := ctrl.redisClient.ZSetClearAllMembers(ctx, createdKey); err != nil {
+		log.WithField("err", err).Errorf("Failed to clear created job rank queue for namespace %s", namespace)
+		return err
+	}
+
+	// 全量填充created队列
+	if len(createdJobs) > 0 {
+		if err := ctrl.redisClient.ZSetAddMulti(ctx, createdKey, createdJobs...); err != nil {
+			log.WithField("err", err).Errorf("Failed to add created jobs to rank queue for namespace %s", namespace)
+			return err
+		}
+	}
+
+	// 清空redis中已有的submitted对立
+	if err := ctrl.redisClient.ZSetClearAllMembers(ctx, submittedKey); err != nil {
+		log.WithField("err", err).Errorf("Failed to clear submitted job rank queue for namespace %s", namespace)
+		return err
+	}
+
+	// 全量填充submitted队列
+	if len(submittedJobs) > 0 {
+		if err := ctrl.redisClient.ZSetAddMulti(ctx, submittedKey, submittedJobs...); err != nil {
+			log.WithField("err", err).Errorf("Failed to add submitted jobs to rank queue for namespace %s", namespace)
+			return err
+		}
+	}
+
+	return nil
+}
+
+// UpdateJobRankQueue 通过mysql状态更新redis
 func (ctrl *RankController) UpdateJobRankQueue(ctx context.Context, jobs []*dao.JobStatus, rankEvent string) {
 	for _, job := range jobs {
 		if job == nil && rankEvent == "" {
