@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +16,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/labels"
 	runtimeutil "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/set"
 	volcanoapis "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 )
@@ -22,6 +24,7 @@ import (
 const (
 	submitterIdleDelay       = time.Second
 	submitterMaxErrorBackoff = 30 * time.Second
+	chunkSize                = 100
 )
 
 var (
@@ -33,7 +36,87 @@ var (
 
 // 定时从db中取任务执行
 func (ctrl *Controller) runCron(ctx context.Context) {
+	// 定时刷新job rank
+	go middleware.SafeUntilWithContext(ctx, "refreshJobRank", ctrl.refreshJobRank, time.Duration(conf.Conf.RefreshJobRankIntervalMinutes)*time.Minute)
+	// 定时扫描db提交job
 	go middleware.SafeUntilWithContext(ctx, "submitJobs", ctrl.submitJobs, time.Minute)
+}
+
+// 定时刷新job rank
+func (ctrl *Controller) refreshJobRank(ctx context.Context) {
+	log.Info("Start refresh job rank")
+
+	nsObjs, _ := ctrl.nsListener.List(labels.Everything())
+	var nss []string
+	for _, v := range nsObjs {
+		nss = append(nss, v.Name)
+	}
+
+	workqueue.ParallelizeUntil(ctx, 50, len(nss), func(index int) {
+		ctrl.doRefreshRank(ctx, nss[index])
+	})
+
+}
+
+func (ctrl *Controller) doRefreshRank(ctx context.Context, ns string) {
+	// 获取job
+	jobs, err := ctrl.db.GetJobStatus(ctx, map[string]interface{}{"phase__in": []string{pkg.JobPhasePending, pkg.JobPhaseQueuing}, "namespace": ns, "k8s": ctrl.k8s}, 0, 0)
+	if err != nil {
+		log.WithField("err", err).Error("Get jobs fail")
+		return
+	}
+	if len(jobs) == 0 {
+		log.WithField("namespace", ns).Info("No pending or queuing jobs found")
+		return
+	}
+
+	// 重新给job排序
+	if err = ctrl.rankController.InitJobRankQueue(ctx, ns, jobs); err != nil {
+		log.WithFields(log.Fields{"err": err, "namespace": ns}).Error("sort jobs in redis fail, sort in cache now")
+	}
+
+	// 对job排序
+	sort.Slice(jobs, func(i, j int) bool {
+		// k8s提交时间为准
+		if jobs[i].SubmittedTime != nil && jobs[j].SubmittedTime == nil {
+			return true
+		}
+		if jobs[i].SubmittedTime == nil && jobs[j].SubmittedTime != nil {
+			return false
+		}
+		// 高优任务优先
+		if jobs[i].Priority != jobs[j].Priority {
+			return pkg.JobPriorityRank(jobs[i].Priority) > pkg.JobPriorityRank(jobs[j].Priority)
+		}
+		// 用户提交时间前面的优先
+		if !jobs[i].JobSubmitedTime.Equal(jobs[j].JobSubmitedTime) {
+			return jobs[i].JobSubmitedTime.Before(jobs[j].JobSubmitedTime)
+		}
+		// jobId字典序
+		return jobs[i].JobID < jobs[j].JobID
+	})
+
+	// 并发批量更新job在db中状态
+	for i := range jobs {
+		jobs[i].ColRank = i + 1
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < len(jobs); i += chunkSize {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			start := index
+			end := index + chunkSize
+			if end > len(jobs) {
+				end = len(jobs)
+			}
+			if err = ctrl.db.BatchUpdateJobRank(ctx, jobs[start:end]); err != nil {
+				log.WithField("err", err).Error("BatchUpdateJobRank fail")
+				return
+			}
+		}(i)
+	}
+	wg.Wait()
 }
 
 // 提交jobs

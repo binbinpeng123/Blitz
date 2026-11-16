@@ -2,11 +2,13 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/binbinpeng123/blitz/pkg/conf"
 	"github.com/go-redis/redis/v7"
+	slardarlog "gitlab.hobot.cc/aidi/slardar/log"
 )
 
 func newTestRedisClient(t *testing.T) (*RedisClient, *miniredis.Miniredis) {
@@ -148,6 +150,105 @@ func TestSetIntValueByKey(t *testing.T) {
 	if got != 42 {
 		t.Fatalf("got %d, want 42", got)
 	}
+}
+
+func TestZSetClearAllMembers(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("removes every member", func(t *testing.T) {
+		rc, mr := newTestRedisClient(t)
+		for _, m := range []string{"a", "b", "c"} {
+			if _, err := mr.ZAdd("queue", 1, m); err != nil {
+				t.Fatalf("seed queue: %v", err)
+			}
+		}
+
+		if err := rc.ZSetClearAllMembers(ctx, "queue"); err != nil {
+			t.Fatalf("ZSetClearAllMembers: %v", err)
+		}
+		if mr.Exists("queue") {
+			t.Fatal("key still exists after clear")
+		}
+	})
+
+	t.Run("missing key is not an error", func(t *testing.T) {
+		rc, _ := newTestRedisClient(t)
+		if err := rc.ZSetClearAllMembers(ctx, "missing"); err != nil {
+			t.Fatalf("ZSetClearAllMembers: %v", err)
+		}
+	})
+
+	t.Run("redis error returned", func(t *testing.T) {
+		mr, err := miniredis.Run()
+		if err != nil {
+			t.Fatalf("miniredis.Run: %v", err)
+		}
+		rc := &RedisClient{Client: redis.NewClient(&redis.Options{Addr: mr.Addr(), MaxRetries: 0})}
+		mr.Close()
+
+		if err := rc.ZSetClearAllMembers(ctx, "queue"); err == nil {
+			t.Fatal("expected error after redis shutdown")
+		}
+	})
+}
+
+func TestZSetAddMulti(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("adds all members across batches", func(t *testing.T) {
+		rc, mr := newTestRedisClient(t)
+		// 超过一批（batchZAddSize）以覆盖分批写入逻辑
+		const total = 2*batchZAddSize + 300
+		items := make([]*redis.Z, 0, total)
+		for i := 0; i < total; i++ {
+			items = append(items, &redis.Z{Member: fmt.Sprintf("m%d", i), Score: float64(i)})
+		}
+
+		if err := rc.ZSetAddMulti(ctx, "big", items...); err != nil {
+			t.Fatalf("ZSetAddMulti: %v", err)
+		}
+		members, err := mr.ZMembers("big")
+		if err != nil {
+			t.Fatalf("ZMembers: %v", err)
+		}
+		if got := len(members); got != total {
+			t.Fatalf("member count = %d, want %d", got, total)
+		}
+		score, err := mr.ZScore("big", "m1234")
+		if err != nil {
+			t.Fatalf("member missing: %v", err)
+		}
+		if score != 1234 {
+			t.Fatalf("score = %v, want 1234", score)
+		}
+	})
+
+	t.Run("empty items is a no-op", func(t *testing.T) {
+		rc, mr := newTestRedisClient(t)
+		if err := rc.ZSetAddMulti(ctx, "empty"); err != nil {
+			t.Fatalf("ZSetAddMulti: %v", err)
+		}
+		if mr.Exists("empty") {
+			t.Fatal("key should not be created for empty items")
+		}
+	})
+
+	t.Run("redis error returned", func(t *testing.T) {
+		mr, err := miniredis.Run()
+		if err != nil {
+			t.Fatalf("miniredis.Run: %v", err)
+		}
+		rc := &RedisClient{Client: redis.NewClient(&redis.Options{Addr: mr.Addr(), MaxRetries: 0})}
+		mr.Close()
+
+		// 错误分支会通过 slardar log 打日志，先初始化避免 nil logger panic
+		slardarlog.Init()
+
+		items := []*redis.Z{{Member: "a", Score: 1}}
+		if err := rc.ZSetAddMulti(ctx, "queue", items...); err == nil {
+			t.Fatal("expected error after redis shutdown")
+		}
+	})
 }
 
 func TestRedisErrorPaths(t *testing.T) {

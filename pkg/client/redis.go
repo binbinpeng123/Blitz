@@ -85,3 +85,23 @@ func (r *RedisClient) SetIntValueByKey(ctx context.Context, key string, val int6
 func (r *RedisClient) ZSetCount(ctx context.Context, key string) (int64, error) {
 	return r.Client.ZCard(key).Result()
 }
+
+func (r *RedisClient) ZSetClearAllMembers(ctx context.Context, key string) error {
+	return r.Client.Del(key).Err()
+}
+
+func (r *RedisClient) ZSetAddMulti(ctx context.Context, key string, items ...*redis.Z) error {
+	for i := 0; i < len(items); i += batchZAddSize {
+		end := i + batchZAddSize
+		if end > len(items) {
+			end = len(items)
+		}
+		batch := items[i:end]
+		if err := r.Client.ZAdd(key, batch...).Err(); err != nil {
+			log.Get(ctx).Errorf("ZSetAddMulti batch failed: key=%s i=%d end=%d", key, i, end)
+			return err
+		}
+	}
+
+	return nil
+}

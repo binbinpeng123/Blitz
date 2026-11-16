@@ -196,6 +196,50 @@ func TestUpdateJobStatus(t *testing.T) {
 	})
 }
 
+func TestBatchUpdateJobRank(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("empty jobs is a no-op", func(t *testing.T) {
+		db, mock := newMockDB(t)
+		if err := (&Dao{DB: db}).BatchUpdateJobRank(ctx, nil); err != nil {
+			t.Fatalf("BatchUpdateJobRank: %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
+	t.Run("builds case update with all ranks", func(t *testing.T) {
+		db, mock := newMockDB(t)
+		mock.ExpectExec("UPDATE job_status SET col_rank = CASE|" +
+			"WHEN id = 7 THEN 1|WHEN id = 3 THEN 2|WHEN id = 9 THEN 3|" +
+			"END WHERE id IN (7,3,9)|phase in ('Queuing', 'Pending')").
+			WillReturnResult(sqlmock.NewResult(0, 3))
+
+		jobs := []*JobStatus{
+			{ID: 7, ColRank: 1},
+			{ID: 3, ColRank: 2},
+			{ID: 9, ColRank: 3},
+		}
+		if err := (&Dao{DB: db}).BatchUpdateJobRank(ctx, jobs); err != nil {
+			t.Fatalf("BatchUpdateJobRank: %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
+	t.Run("exec error returned", func(t *testing.T) {
+		db, mock := newMockDB(t)
+		mock.ExpectExec("UPDATE job_status SET col_rank = CASE").
+			WillReturnError(errors.New("db down"))
+
+		if err := (&Dao{DB: db}).BatchUpdateJobRank(ctx, []*JobStatus{{ID: 1, ColRank: 1}}); err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+}
+
 func assertArgs(t *testing.T, got, want []interface{}) {
 	t.Helper()
 	if len(got) != len(want) {
