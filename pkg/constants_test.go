@@ -2,6 +2,28 @@ package pkg
 
 import "testing"
 
+func TestBuildPriorityClass(t *testing.T) {
+	tests := []struct {
+		priority string
+		want     string
+	}{
+		{Highest, "whitelist"},
+		{Urgent, "urgent"},
+		{High, "high"},
+		{Medium, "medium"},
+		{Low, "low"},
+		{"unknown", "low"},
+		{"", "low"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.priority, func(t *testing.T) {
+			if got := BuildPriorityClass(tt.priority); got != tt.want {
+				t.Fatalf("BuildPriorityClass(%q) = %q, want %q", tt.priority, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestJobPriorityRank(t *testing.T) {
 	tests := []struct {
 		priority string

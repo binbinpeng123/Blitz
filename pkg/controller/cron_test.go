@@ -17,8 +17,14 @@ import (
 	"github.com/go-redis/redis/v7"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+	volcanoapis "volcano.sh/apis/pkg/apis/batch/v1alpha1"
+	volcanov1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	volcanofake "volcano.sh/apis/pkg/client/clientset/versioned/fake"
+	pginformerv1 "volcano.sh/apis/pkg/client/informers/externalversions/scheduling/v1beta1"
+	pglistersv1 "volcano.sh/apis/pkg/client/listers/scheduling/v1beta1"
 )
 
 func TestNextSubmitterDelay(t *testing.T) {
@@ -359,4 +365,249 @@ func TestRefreshJobRank(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
 	}
+}
+
+// fakePodGroupInformer 提供基于本地 indexer 的 Lister，避免起真实 informer。
+type fakePodGroupInformer struct {
+	pginformerv1.PodGroupInformer
+	idx cache.Indexer
+}
+
+func (f *fakePodGroupInformer) Informer() cache.SharedIndexInformer {
+	return &fakeSharedIndexInformer{indexer: f.idx}
+}
+
+func (f *fakePodGroupInformer) Lister() pglistersv1.PodGroupLister {
+	return pglistersv1.NewPodGroupLister(f.idx)
+}
+
+func newPGInformer(t *testing.T, pgs ...*volcanov1beta1.PodGroup) pginformerv1.PodGroupInformer {
+	t.Helper()
+	idx := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	for _, pg := range pgs {
+		if err := idx.Add(pg); err != nil {
+			t.Fatalf("indexer.Add(%s): %v", pg.Name, err)
+		}
+	}
+	return &fakePodGroupInformer{idx: idx}
+}
+
+func newVJInformer(t *testing.T, vjs ...*volcanoapis.Job) *fakeVJInformer {
+	t.Helper()
+	idx := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	for _, vj := range vjs {
+		if err := idx.Add(vj); err != nil {
+			t.Fatalf("indexer.Add(%s): %v", vj.Name, err)
+		}
+	}
+	return &fakeVJInformer{informer: &fakeSharedIndexInformer{indexer: idx}}
+}
+
+// newUpdateJobController 构造 refreshUpdateJob 用例：DB 为 sqlmock，vj/pg 读本地缓存，
+// apiserver 侧由 volcano fake clientset 承接，二者对象可以故意不一致以覆盖时序。
+func newUpdateJobController(t *testing.T, db *dao.Dao, vjInformer *fakeVJInformer, pgInformer pginformerv1.PodGroupInformer, objs ...runtime.Object) (*Controller, *volcanofake.Clientset) {
+	t.Helper()
+	vjc := volcanofake.NewSimpleClientset(objs...)
+	return &Controller{
+		db:            db,
+		k8s:           "c1",
+		nsListener:    newNamespaceLister(t, "default"),
+		vjInformer:    vjInformer,
+		pgInformer:    pgInformer,
+		volcanoClient: vjc,
+	}, vjc
+}
+
+func testVJWithPriority(name, priorityClass string) *volcanoapis.Job {
+	return &volcanoapis.Job{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name},
+		Spec:       volcanoapis.JobSpec{PriorityClassName: priorityClass},
+	}
+}
+
+func testPGWithPriority(name, priorityClass string) *volcanov1beta1.PodGroup {
+	return &volcanov1beta1.PodGroup{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name},
+		Spec:       volcanov1beta1.PodGroupSpec{PriorityClassName: priorityClass},
+	}
+}
+
+func patchCount(client *volcanofake.Clientset) int {
+	n := 0
+	for _, action := range client.Actions() {
+		if action.GetVerb() == "patch" {
+			n++
+		}
+	}
+	return n
+}
+
+func queuingJob(name, priority string) *dao.JobStatus {
+	return &dao.JobStatus{ID: 1, JobID: name, Phase: pkg.JobPhaseQueuing, Priority: priority, Namespace: "default", K8S: "c1"}
+}
+
+func TestDoRefreshUpdateJob(t *testing.T) {
+	ctx := context.Background()
+	selectSQL := `select * from job_status|phase = "Queuing"|namespace = "default"|k8s = "c1"|update_time >=`
+
+	t.Run("patches vj and pg when priority differs", func(t *testing.T) {
+		db, mock := newMockDao(t)
+		mock.ExpectQuery(selectSQL).WillReturnRows(jobStatusRows(queuingJob("job-a", pkg.High)))
+
+		vj := testVJWithPriority("job-a", "low-priority")
+		pg := testPGWithPriority("job-a", "low-priority")
+		ctrl, client := newUpdateJobController(t, db, newVJInformer(t, vj), newPGInformer(t, pg), vj, pg)
+
+		ctrl.doRefreshUpdateJob(ctx, "default")
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+		gotVJ, err := client.BatchV1alpha1().Jobs("default").Get(ctx, "job-a", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get vj: %v", err)
+		}
+		if gotVJ.Spec.PriorityClassName != "high-priority" {
+			t.Fatalf("vj priority = %q, want high-priority", gotVJ.Spec.PriorityClassName)
+		}
+		gotPG, err := client.SchedulingV1beta1().PodGroups("default").Get(ctx, "job-a", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get pg: %v", err)
+		}
+		if gotPG.Spec.PriorityClassName != "high-priority" {
+			t.Fatalf("pg priority = %q, want high-priority", gotPG.Spec.PriorityClassName)
+		}
+		if n := patchCount(client); n != 2 {
+			t.Fatalf("patch actions = %d, want 2", n)
+		}
+	})
+
+	t.Run("skips patch when priority already matches", func(t *testing.T) {
+		db, mock := newMockDao(t)
+		mock.ExpectQuery(selectSQL).WillReturnRows(jobStatusRows(queuingJob("job-a", pkg.Urgent)))
+
+		vj := testVJWithPriority("job-a", "urgent-priority")
+		pg := testPGWithPriority("job-a", "urgent-priority")
+		ctrl, client := newUpdateJobController(t, db, newVJInformer(t, vj), newPGInformer(t, pg), vj, pg)
+
+		ctrl.doRefreshUpdateJob(ctx, "default")
+
+		if n := patchCount(client); n != 0 {
+			t.Fatalf("patch actions = %d, want 0", n)
+		}
+	})
+
+	t.Run("empty priority falls back to low-priority", func(t *testing.T) {
+		db, mock := newMockDao(t)
+		mock.ExpectQuery(selectSQL).WillReturnRows(jobStatusRows(queuingJob("job-a", "")))
+
+		vj := testVJWithPriority("job-a", "high-priority")
+		pg := testPGWithPriority("job-a", "high-priority")
+		ctrl, client := newUpdateJobController(t, db, newVJInformer(t, vj), newPGInformer(t, pg), vj, pg)
+
+		ctrl.doRefreshUpdateJob(ctx, "default")
+
+		gotVJ, err := client.BatchV1alpha1().Jobs("default").Get(ctx, "job-a", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get vj: %v", err)
+		}
+		if gotVJ.Spec.PriorityClassName != "low-priority" {
+			t.Fatalf("vj priority = %q, want low-priority", gotVJ.Spec.PriorityClassName)
+		}
+	})
+
+	t.Run("missing vj in cache skips job", func(t *testing.T) {
+		db, mock := newMockDao(t)
+		mock.ExpectQuery(selectSQL).WillReturnRows(jobStatusRows(queuingJob("job-a", pkg.High)))
+
+		ctrl, client := newUpdateJobController(t, db, newVJInformer(t), newPGInformer(t))
+
+		ctrl.doRefreshUpdateJob(ctx, "default")
+
+		if n := patchCount(client); n != 0 {
+			t.Fatalf("patch actions = %d, want 0", n)
+		}
+	})
+
+	t.Run("missing pg in apiserver is ignored", func(t *testing.T) {
+		db, mock := newMockDao(t)
+		mock.ExpectQuery(selectSQL).WillReturnRows(jobStatusRows(queuingJob("job-a", pkg.High)))
+
+		vj := testVJWithPriority("job-a", "low-priority")
+		// pg 已在缓存中但 apiserver 还没有（VJ controller 尚未创建），patch 返回 NotFound
+		pg := testPGWithPriority("job-a", "low-priority")
+		ctrl, client := newUpdateJobController(t, db, newVJInformer(t, vj), newPGInformer(t, pg), vj)
+
+		ctrl.doRefreshUpdateJob(ctx, "default")
+
+		gotVJ, err := client.BatchV1alpha1().Jobs("default").Get(ctx, "job-a", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get vj: %v", err)
+		}
+		if gotVJ.Spec.PriorityClassName != "high-priority" {
+			t.Fatalf("vj priority = %q, want high-priority", gotVJ.Spec.PriorityClassName)
+		}
+	})
+
+	t.Run("db error skips patches", func(t *testing.T) {
+		db, mock := newMockDao(t)
+		mock.ExpectQuery(selectSQL).WillReturnError(errors.New("db down"))
+
+		vj := testVJWithPriority("job-a", "low-priority")
+		pg := testPGWithPriority("job-a", "low-priority")
+		ctrl, client := newUpdateJobController(t, db, newVJInformer(t, vj), newPGInformer(t, pg), vj, pg)
+
+		ctrl.doRefreshUpdateJob(ctx, "default")
+
+		if n := patchCount(client); n != 0 {
+			t.Fatalf("patch actions = %d, want 0", n)
+		}
+	})
+
+	t.Run("no jobs skips patch", func(t *testing.T) {
+		db, mock := newMockDao(t)
+		mock.ExpectQuery(selectSQL).WillReturnRows(jobStatusRows())
+
+		ctrl, client := newUpdateJobController(t, db, newVJInformer(t), newPGInformer(t))
+
+		ctrl.doRefreshUpdateJob(ctx, "default")
+
+		if n := patchCount(client); n != 0 {
+			t.Fatalf("patch actions = %d, want 0", n)
+		}
+	})
+}
+
+func TestRefreshUpdateJob(t *testing.T) {
+	t.Run("no namespaces returns early", func(t *testing.T) {
+		db, mock := newMockDao(t)
+		ctrl := &Controller{
+			db:            db,
+			k8s:           "c1",
+			nsListener:    newNamespaceLister(t),
+			vjInformer:    newVJInformer(t),
+			pgInformer:    newPGInformer(t),
+			volcanoClient: volcanofake.NewSimpleClientset(),
+		}
+
+		ctrl.refreshUpdateJob(context.Background())
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
+	t.Run("iterates namespaces", func(t *testing.T) {
+		db, mock := newMockDao(t)
+		mock.ExpectQuery(`select * from job_status|namespace = "default"|k8s = "c1"`).
+			WillReturnRows(jobStatusRows())
+
+		ctrl, _ := newUpdateJobController(t, db, newVJInformer(t), newPGInformer(t))
+
+		ctrl.refreshUpdateJob(context.Background())
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
 }

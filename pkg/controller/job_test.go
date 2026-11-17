@@ -8,6 +8,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	volcanoapis "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	volcanoinformerv1 "volcano.sh/apis/pkg/client/informers/externalversions/batch/v1alpha1"
+	volcanolisterv1 "volcano.sh/apis/pkg/client/listers/batch/v1alpha1"
 )
 
 // fakeSharedIndexInformer 只覆写 GetIndexer，其余方法由内嵌接口兜底。
@@ -27,6 +28,11 @@ type fakeVJInformer struct {
 
 func (f *fakeVJInformer) Informer() cache.SharedIndexInformer {
 	return f.informer
+}
+
+// Lister 用 informer 内部的 indexer 构造，保证读到的就是 Add 进去的对象。
+func (f *fakeVJInformer) Lister() volcanolisterv1.JobLister {
+	return volcanolisterv1.NewJobLister(f.informer.GetIndexer())
 }
 
 // newFakeVJInformer 返回带 vjStatusIndex 索引的假 informer，索引 key 与 getVJCount 保持一致。
