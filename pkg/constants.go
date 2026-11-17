@@ -31,6 +31,23 @@ const (
 	FillBackJob    = "fillback"
 )
 
+func BuildPriorityClass(p string) string {
+	switch p {
+	case Highest:
+		return "whitelist"
+	case Urgent:
+		return "urgent"
+	case High:
+		return "high"
+	case Medium:
+		return "medium"
+	case Low:
+		return "low"
+	default:
+		return "low"
+	}
+}
+
 func JobPriorityRank(p string) int {
 	switch p {
 	case Highest:

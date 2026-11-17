@@ -14,7 +14,11 @@ import (
 	"github.com/binbinpeng123/blitz/pkg/middleware"
 	"github.com/binbinpeng123/blitz/pkg/rank"
 	log "github.com/sirupsen/logrus"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/json"
 	runtimeutil "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/set"
@@ -40,6 +44,8 @@ func (ctrl *Controller) runCron(ctx context.Context) {
 	go middleware.SafeUntilWithContext(ctx, "refreshJobRank", ctrl.refreshJobRank, time.Duration(conf.Conf.RefreshJobRankIntervalMinutes)*time.Minute)
 	// 定时扫描db提交job
 	go middleware.SafeUntilWithContext(ctx, "submitJobs", ctrl.submitJobs, time.Minute)
+	// 定时扫描db更行job优先级
+	go middleware.SafeUntilWithContext(ctx, "refreshUpdateJob", ctrl.refreshUpdateJob, time.Minute)
 }
 
 // 定时刷新job rank
@@ -354,5 +360,88 @@ func waitSubmitter(ctx context.Context, delay time.Duration) bool {
 		return false
 	case <-timer.C:
 		return true
+	}
+}
+
+func (ctrl *Controller) refreshUpdateJob(ctx context.Context) {
+	log.Info("Start refreshUpdateJob")
+
+	nsObjs, _ := ctrl.nsListener.List(labels.Everything())
+	if len(nsObjs) == 0 {
+		return
+	}
+	var nss []string
+	for _, v := range nsObjs {
+		nss = append(nss, v.Name)
+	}
+
+	workqueue.ParallelizeUntil(ctx, 50, len(nss), func(index int) {
+		ctrl.doRefreshUpdateJob(ctx, nss[index])
+	})
+}
+
+// PatchStringValue specifies a patch operation for a string.
+type PatchStringValue struct {
+	Op    string      `json:"op"`
+	Path  string      `json:"path"`
+	Value interface{} `json:"value"`
+}
+
+const JobStaleThreshold = 5 * time.Minute // 任务更新时间
+
+func (ctrl *Controller) doRefreshUpdateJob(ctx context.Context, ns string) {
+	// 通过db获取job数据
+	jobs, err := ctrl.db.GetJobStatus(ctx, map[string]interface{}{"phase": pkg.JobPhaseQueuing, "namespace": ns, "k8s": ctrl.k8s, "update_time__ge": time.Now().Add(-JobStaleThreshold).Format(time.DateTime)}, 0, 0)
+	if err != nil {
+		log.WithField("err", err).Error("RefreshUpdateJob: Get jobs fail")
+		return
+	}
+	if len(jobs) == 0 {
+		return
+	}
+
+	for _, job := range jobs {
+		// 构造优先级和patch data
+		expectedPriority := fmt.Sprintf("%s-priority", pkg.BuildPriorityClass(job.Priority))
+		patchData, err := json.Marshal([]PatchStringValue{
+			{
+				Op:    "replace",
+				Path:  "/spec/priorityClassName",
+				Value: expectedPriority,
+			},
+		})
+		if err != nil {
+			log.WithError(err).Errorf("RefreshUpdateJob: marshal patch data for job %s failed", job.JobID)
+			continue
+		}
+
+		// 获取vj
+		vj, err := ctrl.vjInformer.Lister().Jobs(ns).Get(job.JobID)
+		if err != nil || vj == nil {
+			log.WithError(err).Errorf("RefreshUpdateJob: get vj failed job %s", job.JobID)
+			continue
+		}
+
+		// 优先级不同：patch vj informer
+		if expectedPriority != vj.Spec.PriorityClassName {
+			if _, err := ctrl.volcanoClient.BatchV1alpha1().Jobs(ns).Patch(context.TODO(), job.JobID, types.JSONPatchType, patchData, metav1.PatchOptions{}); err != nil {
+				log.WithField("err", err).Error(fmt.Errorf("RefreshUpdateJob: patch vj :%s for err:%v", job.JobID, err))
+				continue
+			}
+		}
+
+		// 获取pg
+		pg, err := ctrl.pgInformer.Lister().PodGroups(ns).Get(job.JobID)
+		if err != nil || pg == nil {
+			log.WithError(err).Errorf("RefreshUpdateJob: get pg failed job %s", job.JobID)
+			continue
+		}
+
+		// 优先级不同：patch pg informer
+		if expectedPriority != pg.Spec.PriorityClassName {
+			if _, err := ctrl.volcanoClient.SchedulingV1beta1().PodGroups(ns).Patch(context.TODO(), job.JobID, types.JSONPatchType, patchData, metav1.PatchOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				log.WithField("err", err).Error(fmt.Errorf("RefreshUpdateJob: patch pg :%s for err:%v", job.JobID, err))
+			}
+		}
 	}
 }
